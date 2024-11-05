@@ -7,7 +7,10 @@ from ryu.app.ofctl.api import get_datapath
 from ryu.lib.packet import packet
 from ryu.lib.packet import ethernet
 from ryu.lib.packet import ether_types
+from ryu.lib.packet import in_proto
 from ryu.lib.packet import ipv4
+from ryu.lib.packet import tcp
+from ryu.lib.packet import udp
 from ryu.lib.packet import arp
 import ryu.topology.event as topo_event
 
@@ -15,8 +18,8 @@ import networkx as nx
 import time
 from time import sleep
 
-IDLE_TIMEOUT = 30
-HARD_TIMEOUT = 30
+IDLE_TIMEOUT = 15
+HARD_TIMEOUT = 60
 
 
 class Mapper():
@@ -49,6 +52,55 @@ class Mapper():
         self._ip2dpid[ip] = (dpid, port)
 
 
+class Pather():
+    """ deal with paths. caches paths info """
+
+    def __init__(self):
+        self._paths = {}  # (src, dst): { i, paths:[[p1], [p2],...] }
+
+    def add(self, src, dst, path):
+        """ add a path from src to dst """
+
+        if not self.exist(src, dst):
+            self._paths[src, dst] = {}
+            self._paths[src, dst]["i"] = 0
+            self._paths[src, dst]["paths"] = []
+
+        self._paths[src, dst]["paths"].append(path)
+
+    def get(self, src, dst):
+        """
+        return the next available path from src to dst using round
+        robin. otherwise return None
+        """
+
+        if not self.exist(src, dst):
+            return None
+
+        i = self._paths[src, dst]["i"]
+        paths = self._paths[src, dst]["paths"]
+        path = paths[i % len(paths)]
+        self._paths[src, dst]["i"] += 1
+        return path
+
+    def getall(self, src, dst):
+        """ get all the known paths """
+        if not self.exist(src, dst):
+            return None
+
+        return self._paths[src, dst]["paths"]
+
+    def exist(self, src, dst):
+        """ reports whether a path exists from src to dst """
+        if (src, dst) not in self._paths:
+            return False
+        return True
+
+    def clear(self):
+        """ clear all the paths """
+        self._paths.clear()
+
+
 class Balancer(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
@@ -56,6 +108,7 @@ class Balancer(app_manager.RyuApp):
         super(Balancer, self).__init__(*args, **kwargs)
         self.G = nx.DiGraph()
         self.M = Mapper()
+        self.P = Pather()
 
     def _arp_handler(self, dp, in_port, pkt):
         """ handle ARP PacketIn's """
@@ -98,7 +151,7 @@ class Balancer(app_manager.RyuApp):
             self.logger.info("Mapper does not know where %s connected", h.dst)
             return
 
-        paths = self._lb_find_paths(h.src, h.dst)
+        paths = self._lb_findpaths(h.src, h.dst)
         self.logger.info("paths from %s to %s: %s", h.src, h.dst, paths)
         path = self._lb_choose_path(paths)
         self.logger.info("path %s is choosen", path)
@@ -119,7 +172,65 @@ class Balancer(app_manager.RyuApp):
         dp.send_msg(msg)
         self.logger.info("")
 
-    def _lb_find_paths(self, src_ip, dst_ip):
+    def _tcp_handler(self, dp, in_port, pkt):
+        """ handle TCP PacketIn's """
+        ofproto = dp.ofproto
+        parser = dp.ofproto_parser
+        h_ip = pkt.get_protocol(ipv4.ipv4)
+        h = pkt.get_protocol(tcp.tcp)
+
+        if self.M.ip2dpid(h_ip.dst) is None:
+            self.logger.info("Mapper does not know where %s connected",
+                             h_ip.dst)
+            return
+
+        path = self._lb_getpath(h_ip.src, h_ip.dst)
+        paths = self.P.getall(h_ip.src, h_ip.dst)
+        self.logger.info("paths from %s to %s: %s", h_ip.src, h_ip.dst, paths)
+        self.logger.info("path %s is choosen", path)
+
+        match = parser.OFPMatch(
+            eth_type=ether_types.ETH_TYPE_IP,
+            ipv4_src=h_ip.src,
+            ipv4_dst=h_ip.dst,
+            ip_proto=in_proto.IPPROTO_TCP,
+            tcp_src=h.src_port,
+            tcp_dst=h.dst_port)
+        self._lb_install_path(path, h_ip.src, h_ip.dst, match)
+
+        # reverse path
+        path = list(reversed(path))
+        match = parser.OFPMatch(
+            eth_type=ether_types.ETH_TYPE_IP,
+            ipv4_src=h_ip.dst,
+            ipv4_dst=h_ip.src,
+            ip_proto=in_proto.IPPROTO_TCP,
+            tcp_src=h.dst_port,
+            tcp_dst=h.src_port)
+        self._lb_install_path(path, h_ip.dst, h_ip.src, match)
+
+        # reprocess this packet again
+        msg = parser.OFPPacketOut(datapath=dp,
+                                  buffer_id=ofproto.OFP_NO_BUFFER,
+                                  in_port=in_port,
+                                  actions=[parser.OFPActionOutput(
+                                      ofproto.OFPP_TABLE)],
+                                  data=pkt.data)
+        dp.send_msg(msg)
+        self.logger.info("")
+
+    def _lb_getpath(self, src_ip, dst_ip):
+        if not self.P.exist(src_ip, dst_ip):
+            node1, _ = self.M.ip2dpid(src_ip)
+            node2, _ = self.M.ip2dpid(dst_ip)
+            paths = list(nx.all_shortest_paths(self.G, node1, node2))
+            for p in paths:
+                self.P.add(src_ip, dst_ip, p)
+
+        path = self.P.get(src_ip, dst_ip)
+        return path
+
+    def _lb_findpaths(self, src_ip, dst_ip):
         node1, _ = self.M.ip2dpid(src_ip)
         node2, _ = self.M.ip2dpid(dst_ip)
 
@@ -141,8 +252,8 @@ class Balancer(app_manager.RyuApp):
             parser = dp.ofproto_parser
             actions = [parser.OFPActionOutput(port)]
 
-            self.logger.info("addflow dp %s match %s output port %d",
-                             dpid, match, port)
+            self.logger.debug("addflow dp %s match %s output port %d",
+                              dpid, match, port)
             self.add_flow(dp, prio=10, idle=IDLE_TIMEOUT,
                           hard=HARD_TIMEOUT, match=match, actions=actions)
 
@@ -150,8 +261,8 @@ class Balancer(app_manager.RyuApp):
         # single datapath.
         dpid = path[-1]
         port = self.M.ip2dpid(dst_ip)[1]
-        self.logger.info("addflow dp %s match %s output port %d",
-                         dpid, match, port)
+        self.logger.debug("addflow dp %s match %s output port %d",
+                          dpid, match, port)
         dp = get_datapath(self, dpid)
         parser = dp.ofproto_parser
         actions = [parser.OFPActionOutput(port)]
@@ -230,10 +341,18 @@ class Balancer(app_manager.RyuApp):
             self._arp_handler(dp, in_port, pkt)
             return
 
+        if ip.proto == in_proto.IPPROTO_TCP:
+            h = pkt.get_protocol(tcp.tcp)
+            self.logger.info(
+                "dp %s PacketIn type TCP in_port %s src %s:%s dst %s:%s",
+                dp.id, in_port, ip.src, h.src_port, ip.dst, h.dst_port)
+            self._tcp_handler(dp, in_port, pkt)
+            return
+
         if eth.ethertype == ether_types.ETH_TYPE_IP:
             h = pkt.get_protocol(ipv4.ipv4)
             self.logger.info(
-                "dp %s PacketIn type IP in_port %s ipv4_src %s ipv4_dst %s",
+                "dp %s PacketIn type IP in_port %s src %s dst %s",
                 dp.id, in_port, ip.src, ip.dst)
             self._ip_handler(dp, in_port, pkt)
             return
@@ -301,6 +420,3 @@ class Balancer(app_manager.RyuApp):
 
 # TODO: the cache of the Mapper should be cleaned periodically
 # TODO: document your code...
-# TODO: use idle and hard timeout instead of adding paths permanently
-# TODO: consider using transport layer header for load balancing
-# TODO: consider using a Weighted graph
