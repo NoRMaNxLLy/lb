@@ -1,25 +1,19 @@
 from ryu.base import app_manager
 from ryu.ofproto import ofproto_v1_3
 from ryu.controller import ofp_event
-from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
-from ryu.controller.handler import set_ev_cls
 from ryu.app.ofctl.api import get_datapath
-from ryu.lib.packet import packet
-from ryu.lib.packet import ethernet
-from ryu.lib.packet import ether_types
-from ryu.lib.packet import in_proto
-from ryu.lib.packet import ipv4
-from ryu.lib.packet import tcp
-from ryu.lib.packet import udp
-from ryu.lib.packet import arp
 import ryu.topology.event as topo_event
+from ryu.controller.handler import (CONFIG_DISPATCHER, MAIN_DISPATCHER,
+                                    set_ev_cls)
+from ryu.lib.packet import (packet, ethernet, ether_types, in_proto,
+                            ipv4, icmp, tcp, udp, arp)
 
 import networkx as nx
-import time
 from time import sleep
 
 IDLE_TIMEOUT = 15
 HARD_TIMEOUT = 60
+path_func = nx.all_shortest_paths
 
 
 class Mapper():
@@ -53,7 +47,7 @@ class Mapper():
 
 
 class Pather():
-    """ deal with paths. caches paths info """
+    """ deals with paths. caches paths info """
 
     def __init__(self):
         self._paths = {}  # (src, dst): { i, paths:[[p1], [p2],...] }
@@ -118,26 +112,29 @@ class Balancer(app_manager.RyuApp):
 
         if self.M.ip2dpid(h.dst_ip) is None:
             self.logger.info("dst %s is not known. flooding...", h.dst_ip)
-            msg = parser.OFPPacketOut(datapath=dp,
-                                      buffer_id=ofproto.OFP_NO_BUFFER,
-                                      in_port=in_port,
-                                      actions=[parser.OFPActionOutput(
-                                          ofproto.OFPP_ALL)],
-                                      data=pkt.data)
+            msg = parser.OFPPacketOut(
+                datapath=dp,
+                buffer_id=ofproto.OFP_NO_BUFFER,
+                in_port=in_port,
+                actions=[parser.OFPActionOutput(ofproto.OFPP_ALL)],
+                data=pkt.data
+            )
             dp.send_msg(msg)
             self.logger.info("")
             return
 
         _dpid, _port = self.M.ip2dpid(h.dst_ip)
         _dp = get_datapath(self, _dpid)
-        self.logger.info("send ARP message through %s port %s", _dpid,
-                         _port)
-        msg = parser.OFPPacketOut(datapath=_dp,
-                                  buffer_id=ofproto.OFP_NO_BUFFER,
-                                  in_port=ofproto.OFPP_CONTROLLER,
-                                  actions=[parser.OFPActionOutput(
-                                      _port)],
-                                  data=pkt.data)
+
+        self.logger.info("send ARP message through %s port %s", _dpid, _port)
+        msg = parser.OFPPacketOut(
+            datapath=_dp,
+            buffer_id=ofproto.OFP_NO_BUFFER,
+            in_port=ofproto.OFPP_CONTROLLER,
+            actions=[parser.OFPActionOutput(_port)],
+            data=pkt.data
+        )
+
         _dp.send_msg(msg)
         self.logger.info("")
 
@@ -146,103 +143,70 @@ class Balancer(app_manager.RyuApp):
         ofproto = dp.ofproto
         parser = dp.ofproto_parser
         h = pkt.get_protocol(ipv4.ipv4)
+        fields = {
+            "eth_type": ether_types.ETH_TYPE_IP,
+            "ipv4_src": h.src,
+            "ipv4_dst": h.dst
+        }
 
         if self.M.ip2dpid(h.dst) is None:
             self.logger.info("Mapper does not know where %s connected", h.dst)
             return
 
-        paths = self._lb_findpaths(h.src, h.dst)
-        self.logger.info("paths from %s to %s: %s", h.src, h.dst, paths)
-        path = self._lb_choose_path(paths)
-        self.logger.info("path %s is choosen", path)
-
-        match = parser.OFPMatch(
-            eth_type=ether_types.ETH_TYPE_IP,
-            ipv4_src=h.src,
-            ipv4_dst=h.dst)
-        self._lb_install_path(path, h.src, h.dst, match)
-
-        # reprocess this packet again
-        msg = parser.OFPPacketOut(datapath=dp,
-                                  buffer_id=ofproto.OFP_NO_BUFFER,
-                                  in_port=in_port,
-                                  actions=[parser.OFPActionOutput(
-                                      ofproto.OFPP_TABLE)],
-                                  data=pkt.data)
-        dp.send_msg(msg)
-        self.logger.info("")
-
-    def _tcp_handler(self, dp, in_port, pkt):
-        """ handle TCP PacketIn's """
-        ofproto = dp.ofproto
-        parser = dp.ofproto_parser
-        h_ip = pkt.get_protocol(ipv4.ipv4)
-        h = pkt.get_protocol(tcp.tcp)
-
-        if self.M.ip2dpid(h_ip.dst) is None:
-            self.logger.info("Mapper does not know where %s connected",
-                             h_ip.dst)
+        path = self._getpath(h.src, h.dst)
+        paths = self.P.getall(h.src, h.dst)
+        if path is None:
+            self.logger.info("no path from % to % exists", h.src, h.dst)
             return
 
-        path = self._lb_getpath(h_ip.src, h_ip.dst)
-        paths = self.P.getall(h_ip.src, h_ip.dst)
-        self.logger.info("paths from %s to %s: %s", h_ip.src, h_ip.dst, paths)
+        self.logger.info("paths from %s to %s: %s", h.src, h.dst, paths)
         self.logger.info("path %s is choosen", path)
 
-        match = parser.OFPMatch(
-            eth_type=ether_types.ETH_TYPE_IP,
-            ipv4_src=h_ip.src,
-            ipv4_dst=h_ip.dst,
-            ip_proto=in_proto.IPPROTO_TCP,
-            tcp_src=h.src_port,
-            tcp_dst=h.dst_port)
-        self._lb_install_path(path, h_ip.src, h_ip.dst, match)
+        if pkt.get_protocol(icmp.icmp):
+            h_icmp = pkt.get_protocol
+            fields["ip_proto"] = in_proto.IPPROTO_ICMP
 
-        # reverse path
-        path = list(reversed(path))
-        match = parser.OFPMatch(
-            eth_type=ether_types.ETH_TYPE_IP,
-            ipv4_src=h_ip.dst,
-            ipv4_dst=h_ip.src,
-            ip_proto=in_proto.IPPROTO_TCP,
-            tcp_src=h.dst_port,
-            tcp_dst=h.src_port)
-        self._lb_install_path(path, h_ip.dst, h_ip.src, match)
+        elif pkt.get_protocol(tcp.tcp):
+            h_tcp = pkt.get_protocol(tcp.tcp)
+            fields["ip_proto"] = in_proto.IPPROTO_TCP
+            fields["tcp_src"] = h_tcp.src_port
+            fields["tcp_dst"] = h_tcp.dst_port
+
+        elif pkt.get_protocol(udp.udp):
+            h_udp = pkt.get_protocol(udp.udp)
+            fields["ip_proto"] = in_proto.IPPROTO_UDP
+            fields["udp_src"] = h_udp.src_port
+            fields["udp_dst"] = h_udp.dst_port
+
+        self.logger.info("match fields: %s", fields)
+
+        match = parser.OFPMatch(**fields)
+        self._installpath(path, h.src, h.dst, match)
 
         # reprocess this packet again
-        msg = parser.OFPPacketOut(datapath=dp,
-                                  buffer_id=ofproto.OFP_NO_BUFFER,
-                                  in_port=in_port,
-                                  actions=[parser.OFPActionOutput(
-                                      ofproto.OFPP_TABLE)],
-                                  data=pkt.data)
+        msg = parser.OFPPacketOut(
+            datapath=dp,
+            buffer_id=ofproto.OFP_NO_BUFFER,
+            in_port=in_port,
+            actions=[parser.OFPActionOutput(ofproto.OFPP_TABLE)],
+            data=pkt.data
+        )
         dp.send_msg(msg)
         self.logger.info("")
 
-    def _lb_getpath(self, src_ip, dst_ip):
+    def _getpath(self, src_ip, dst_ip):
         if not self.P.exist(src_ip, dst_ip):
             node1, _ = self.M.ip2dpid(src_ip)
             node2, _ = self.M.ip2dpid(dst_ip)
-            paths = list(nx.all_shortest_paths(self.G, node1, node2))
+            paths = list(path_func(self.G, node1, node2))
             for p in paths:
                 self.P.add(src_ip, dst_ip, p)
 
         path = self.P.get(src_ip, dst_ip)
         return path
 
-    def _lb_findpaths(self, src_ip, dst_ip):
-        node1, _ = self.M.ip2dpid(src_ip)
-        node2, _ = self.M.ip2dpid(dst_ip)
-
-        paths = list(nx.all_shortest_paths(self.G, node1, node2))
-        return paths
-
-    def _lb_choose_path(self, paths):
-        # TODO: do a round robin
-        return paths[time.time_ns() % len(paths)]
-
     # TODO: this mess is not right and needs refactoring....
-    def _lb_install_path(self, path, src_ip, dst_ip, match):
+    def _installpath(self, path, src_ip, dst_ip, match):
         edges = list(zip(path, path[1:]))   # [(s1, s2)...]
 
         for e in edges:
@@ -281,9 +245,7 @@ class Balancer(app_manager.RyuApp):
 
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(
-            ofproto.OFPP_CONTROLLER,
-            ofproto.OFPCML_NO_BUFFER
-        )]
+            ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
 
         self.add_flow(dp, prio=0, match=match, actions=actions)
 
@@ -341,14 +303,6 @@ class Balancer(app_manager.RyuApp):
             self._arp_handler(dp, in_port, pkt)
             return
 
-        if ip.proto == in_proto.IPPROTO_TCP:
-            h = pkt.get_protocol(tcp.tcp)
-            self.logger.info(
-                "dp %s PacketIn type TCP in_port %s src %s:%s dst %s:%s",
-                dp.id, in_port, ip.src, h.src_port, ip.dst, h.dst_port)
-            self._tcp_handler(dp, in_port, pkt)
-            return
-
         if eth.ethertype == ether_types.ETH_TYPE_IP:
             h = pkt.get_protocol(ipv4.ipv4)
             self.logger.info(
@@ -369,8 +323,7 @@ class Balancer(app_manager.RyuApp):
         self.logger.info("adding datapath to Graph: %s", dpid)
         self.G.add_node(dpid)
 
-        self.logger.info("number of nodes: %s\n",
-                         self.G.number_of_nodes())
+        self.logger.info("number of nodes: %s\n", self.G.number_of_nodes())
 
         # Request port/link descriptions, useful for obtaining bandwidth
 #         req = ofp_parser.OFPPortDescStatsRequest(switch)
@@ -418,5 +371,6 @@ class Balancer(app_manager.RyuApp):
                          self.G.number_of_edges())
 
 
-# TODO: the cache of the Mapper should be cleaned periodically
+# TODO: the cache of the Mapper should be cleaned periodically...
+# TODO: the cache of the Pather should adapt to network changes...
 # TODO: document your code...
